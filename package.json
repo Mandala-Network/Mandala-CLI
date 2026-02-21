@@ -1,0 +1,28 @@
+{
+    "name": "@bsv/mandala-cli",
+    "version": "1.0.0",
+    "main": "dist/index.js",
+    "type": "module",
+    "bin": {
+        "mandala": "dist/index.js"
+    },
+    "scripts": {
+        "build": "tsc"
+    },
+    "dependencies": {
+        "@bsv/sdk": "^2.0.1",
+        "@bsv/wallet-toolbox-client": "^2.0.5",
+        "axios": "^1.4.0",
+        "chalk": "^4.1.2",
+        "cli-table3": "^0.6.5",
+        "commander": "^10.0.0",
+        "inquirer": "^12.1.0",
+        "ora": "^6.1.2",
+        "tar": "^7.5.7"
+    },
+    "devDependencies": {
+        "@types/node": "^20.17.46",
+        "@types/tar": "^6.1.13",
+        "typescript": "^5.2.2"
+    }
+}
