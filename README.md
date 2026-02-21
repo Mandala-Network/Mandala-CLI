@@ -236,4 +236,4 @@ const info = await client.getProjectInfo(nodeUrl, projectId)
 
 ## License
 
-MIT
+OpenBSV
