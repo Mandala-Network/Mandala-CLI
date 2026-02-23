@@ -15,7 +15,8 @@ import {
 import { buildArtifact, findArtifacts, findLatestArtifact, printArtifactsList, artifactMenu } from './artifact.js';
 import { projectMenu, showProjectInfo, fetchResourceLogs, pickReleaseId, showGlobalPublicInfo } from './project.js';
 import { releaseMenu } from './release.js';
-import { agentInit, agentDeploy, agentChat, agentFund, agentStatus, agentConfigSet, agentConfigGet, agentLogs, agentRestart, agentMenu } from './agent.js';
+import { agentInit, agentDeploy, agentChat, agentFund, agentStatus, agentConfigSet, agentConfigGet, agentLogs, agentRestart, agentBilling, agentMenu } from './agent.js';
+import { discoverNodes, discoverGpuNodes, probeKnownNodes, printDiscoveredNodes } from './registry.js';
 import {
   ensureRegistered, safeRequest, buildAuthFetch, handleRequestError,
   uploadArtifact, printProjectList, printAdminsList, printLogs, printReleasesList
@@ -706,6 +707,17 @@ agentCommand
   });
 
 agentCommand
+  .command('billing [configName]')
+  .option('--key <key>', 'Private key')
+  .option('--network <network>', 'Network')
+  .option('--storage <storage>', 'Wallet storage')
+  .description('View billing across all services')
+  .action(async (configName, options) => {
+    if (options.key) await remakeWallet(options.key, options.network, options.storage);
+    await agentBilling(configName);
+  });
+
+agentCommand
   .command('restart [configName]')
   .option('--key <key>', 'Private key')
   .option('--network <network>', 'Network')
@@ -723,6 +735,82 @@ agentCommand
   .action(async (options) => {
     if (options.key) await remakeWallet(options.key, options.network, options.storage);
     await agentMenu();
+  });
+
+// ─── Providers Commands ───────────────────────────────────────────────────────
+
+const providersCommand = program
+  .command('providers')
+  .description('Discover and manage Mandala Network providers');
+
+providersCommand
+  .command('discover')
+  .option('--gpu', 'Only show GPU-capable nodes')
+  .option('--gpu-type <type>', 'Filter by GPU type (e.g. A100)')
+  .option('--key <key>', 'Private key')
+  .option('--network <network>', 'Network')
+  .option('--storage <storage>', 'Wallet storage')
+  .description('Discover available Mandala Network nodes via BSV overlay')
+  .action(async (options) => {
+    if (options.key) await remakeWallet(options.key, options.network, options.storage);
+    const spinner = (await import('ora')).default('Querying overlay for nodes...').start();
+    try {
+      const filter: any = {};
+      if (options.gpu) filter.gpu = true;
+      if (options.gpuType) filter.gpuType = options.gpuType;
+      const nodes = await discoverNodes(Object.keys(filter).length > 0 ? filter : undefined);
+      spinner.succeed(`Found ${nodes.length} node(s).`);
+      printDiscoveredNodes(nodes);
+    } catch (e: any) {
+      spinner.fail(`Discovery failed: ${e.message}`);
+    }
+  });
+
+providersCommand
+  .command('list')
+  .description('Show locally known providers from mandala.json configs')
+  .action(async () => {
+    const info = tryLoadMandalaConfigInfo();
+    if (!info?.configs?.length) {
+      console.log(chalk.yellow('No configurations found.'));
+      return;
+    }
+    const urls = [...new Set(
+      info.configs
+        .filter(c => isMandalaConfig(c) && c.MandalaCloudURL)
+        .map(c => c.MandalaCloudURL!)
+    )];
+    if (urls.length === 0) {
+      console.log(chalk.yellow('No Mandala Node URLs configured.'));
+      return;
+    }
+    const spinner = (await import('ora')).default('Probing known nodes...').start();
+    const nodes = await probeKnownNodes(urls);
+    spinner.succeed(`Probed ${nodes.length} node(s).`);
+    printDiscoveredNodes(nodes);
+  });
+
+providersCommand
+  .command('add <url>')
+  .description('Manually add a provider URL to mandala.json')
+  .action(async (url) => {
+    let info = tryLoadMandalaConfigInfo();
+    if (!info) {
+      info = { schema: 'mandala-config', schemaVersion: '1.0', configs: [] };
+    }
+    info.configs = info.configs || [];
+    const existing = info.configs.find(c => c.MandalaCloudURL === url);
+    if (existing) {
+      console.log(chalk.yellow(`Provider ${url} already configured as "${existing.name}".`));
+      return;
+    }
+    info.configs.push({
+      name: `provider-${info.configs.length}`,
+      provider: 'mandala',
+      MandalaCloudURL: url,
+    });
+    saveMandalaConfigInfo(info);
+    console.log(chalk.green(`Provider ${url} added to mandala.json.`));
   });
 
 // ─── Main Menu ─────────────────────────────────────────────────────────────────

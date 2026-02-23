@@ -3,9 +3,10 @@ import path from 'path';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import Table from 'cli-table3';
+import axios from 'axios';
 import { authFetch, walletClient, remakeWallet } from './wallet.js';
 import { ensureRegistered, safeRequest, buildAuthFetch, handleRequestError } from './utils.js';
-import type { MandalaConfigInfo, MandalaConfig, ProjectListing } from './types.js';
+import type { MandalaConfigInfo, MandalaConfig, ProjectListing, NodeCapabilities, ServiceDefinition } from './types.js';
 import { PrivateKey, WalletNetwork } from '@bsv/sdk';
 
 const MANDALA_CONFIG_PATH = path.resolve(process.cwd(), 'mandala.json');
@@ -664,4 +665,25 @@ export async function configMenu() {
       done = true;
     }
   }
+}
+
+// ---------- Provider Probing ----------
+
+export async function probeNodeCapabilities(url: string): Promise<NodeCapabilities> {
+  const resp = await axios.get(`${url}/api/v1/public`);
+  return {
+    url,
+    gpu: resp.data.gpu || { enabled: false },
+    pricing: resp.data.pricing || {},
+    supportedRuntimes: resp.data.supportedRuntimes || [],
+    schemaVersionsSupported: resp.data.schemaVersionsSupported || ['1.0'],
+  };
+}
+
+export function matchServiceToProvider(svc: ServiceDefinition, providers: NodeCapabilities[]): NodeCapabilities[] {
+  return providers.filter(p => {
+    if (svc.resources?.gpu && !p.gpu?.enabled) return false;
+    if (svc.resources?.gpu && p.gpu?.available === 0) return false;
+    return true;
+  });
 }

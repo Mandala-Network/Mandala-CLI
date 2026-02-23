@@ -10,13 +10,15 @@ import { loadMandalaConfigInfo, tryLoadMandalaConfigInfo, saveMandalaConfigInfo,
 import { ensureRegistered, safeRequest, buildAuthFetch, handleRequestError, uploadArtifact } from './utils.js';
 import { authFetch, walletClient } from './wallet.js';
 import { PrivateKey, PublicKey, P2PKH } from '@bsv/sdk';
-import type { AgentManifest, MandalaConfig, MandalaConfigInfo, ProjectInfo, ProjectListing } from './types.js';
-import { VALID_LOG_PERIODS, VALID_LOG_LEVELS, MAX_TAIL_LINES } from './types.js';
+import type { AgentManifest, AgentManifestV2, ServiceDefinition, ServiceLink, DeploymentTarget, MandalaConfig, MandalaConfigInfo, ProjectInfo, ProjectListing } from './types.js';
+import { isV2Manifest, VALID_LOG_PERIODS, VALID_LOG_LEVELS, MAX_TAIL_LINES } from './types.js';
 import type { LogPeriod, LogLevel } from './types.js';
+import { probeNodeCapabilities, matchServiceToProvider } from './config.js';
+import { discoverGpuNodes } from './registry.js';
 
 const MANIFEST_FILE = 'agent-manifest.json';
 
-function loadAgentManifest(): AgentManifest {
+function loadAgentManifest(): AgentManifest | AgentManifestV2 {
   const manifestPath = path.resolve(process.cwd(), MANIFEST_FILE);
   if (!fs.existsSync(manifestPath)) {
     console.error(chalk.red(`No ${MANIFEST_FILE} found in the current directory.`));
@@ -31,7 +33,7 @@ function loadAgentManifest(): AgentManifest {
   return manifest;
 }
 
-function tryLoadAgentManifest(): AgentManifest | null {
+function tryLoadAgentManifest(): AgentManifest | AgentManifestV2 | null {
   const manifestPath = path.resolve(process.cwd(), MANIFEST_FILE);
   if (!fs.existsSync(manifestPath)) return null;
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
@@ -164,6 +166,22 @@ async function resolveDeploymentConfig(manifest: AgentManifest, configName?: str
 export async function agentInit(options?: { silent?: boolean }) {
   console.log(chalk.blue('Agent Manifest Initialization Wizard\n'));
 
+  const { deploymentType } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'deploymentType',
+      message: 'Deployment type:',
+      choices: [
+        { name: 'Single service (one node)', value: 'single' },
+        { name: 'Multi-service (split across providers)', value: 'multi' }
+      ]
+    }
+  ]);
+
+  if (deploymentType === 'multi') {
+    return agentInitMultiService(options);
+  }
+
   const { agentType } = await inquirer.prompt([
     {
       type: 'list',
@@ -191,6 +209,17 @@ export async function agentInit(options?: { silent?: boolean }) {
     { type: 'input', name: 'cpu', message: 'CPU limit (e.g. 500m, 1000m):', default: '500m' },
     { type: 'input', name: 'memory', message: 'Memory limit (e.g. 512Mi, 1Gi):', default: '512Mi' }
   ]);
+
+  const { enableGpu } = await inquirer.prompt([
+    { type: 'confirm', name: 'enableGpu', message: 'Requires GPU?', default: false }
+  ]);
+  let gpuCount: string | undefined;
+  if (enableGpu) {
+    const { gpuUnits } = await inquirer.prompt([
+      { type: 'input', name: 'gpuUnits', message: 'Number of GPUs:', default: '1' }
+    ]);
+    gpuCount = gpuUnits;
+  }
 
   const { port } = await inquirer.prompt([
     { type: 'number', name: 'port', message: 'Primary port:', default: 3000 }
@@ -348,7 +377,7 @@ export async function agentInit(options?: { silent?: boolean }) {
       runtime
     },
     env: envVars,
-    resources: { cpu, memory },
+    resources: { cpu, memory, ...(gpuCount ? { gpu: gpuCount } : {}) },
     ports: [port],
     healthCheck: {
       path: healthPath,
@@ -375,6 +404,138 @@ export async function agentInit(options?: { silent?: boolean }) {
   }
 }
 
+async function agentInitMultiService(options?: { silent?: boolean }) {
+  console.log(chalk.blue('Multi-Service Agent Manifest Wizard\n'));
+
+  const services: Record<string, ServiceDefinition> = {};
+  const deploymentTargets: DeploymentTarget[] = [];
+  const links: ServiceLink[] = [];
+
+  // Add services
+  let addMore = true;
+  while (addMore) {
+    const { name } = await inquirer.prompt([
+      { type: 'input', name: 'name', message: 'Service name (e.g. "agidentity-agent", "llama-inference"):', validate: (v: string) => v.trim() ? true : 'Required' }
+    ]);
+
+    const { agentType } = await inquirer.prompt([{
+      type: 'list', name: 'agentType', message: `Agent type for "${name}":`,
+      choices: [
+        { name: 'AGIdentity', value: 'agidentity' },
+        { name: 'OpenClaw', value: 'openclaw' },
+        { name: 'Custom', value: 'custom' }
+      ]
+    }]);
+
+    const { runtime } = await inquirer.prompt([
+      { type: 'list', name: 'runtime', message: 'Runtime:', choices: ['node', 'python', 'docker'], default: 'node' }
+    ]);
+
+    const { cpu, memory } = await inquirer.prompt([
+      { type: 'input', name: 'cpu', message: 'CPU:', default: '500m' },
+      { type: 'input', name: 'memory', message: 'Memory:', default: '512Mi' }
+    ]);
+
+    const { enableGpu } = await inquirer.prompt([
+      { type: 'confirm', name: 'enableGpu', message: 'Requires GPU?', default: false }
+    ]);
+    let gpu: string | undefined;
+    if (enableGpu) {
+      const { gpuUnits } = await inquirer.prompt([
+        { type: 'input', name: 'gpuUnits', message: 'GPUs:', default: '1' }
+      ]);
+      gpu = gpuUnits;
+    }
+
+    const { port } = await inquirer.prompt([
+      { type: 'number', name: 'port', message: 'Port:', default: agentType === 'agidentity' ? 3000 : 8080 }
+    ]);
+
+    const { healthPath } = await inquirer.prompt([
+      { type: 'input', name: 'healthPath', message: 'Health check path:', default: '/health' }
+    ]);
+
+    const { providerName } = await inquirer.prompt([
+      { type: 'input', name: 'providerName', message: `Provider alias for "${name}" (e.g. "cpu-node", "gpu-node"):`, default: enableGpu ? 'gpu-node' : 'cpu-node' }
+    ]);
+
+    // Ensure deployment target exists
+    if (!deploymentTargets.find(d => d.name === providerName)) {
+      const { url } = await inquirer.prompt([
+        { type: 'input', name: 'url', message: `Mandala Node URL for "${providerName}":`, default: 'https://cars.babbage.systems' }
+      ]);
+      const { network } = await inquirer.prompt([
+        { type: 'input', name: 'network', message: 'Network:', default: 'mainnet' }
+      ]);
+      deploymentTargets.push({
+        name: providerName,
+        provider: 'mandala',
+        MandalaCloudURL: url,
+        network,
+        ...(enableGpu ? { capabilities: { gpu: true } } : {}),
+      });
+    }
+
+    services[name] = {
+      agent: { type: agentType, runtime },
+      resources: { cpu, memory, ...(gpu ? { gpu } : {}) },
+      ports: [port],
+      healthCheck: { path: healthPath, port },
+      provider: providerName,
+    };
+
+    const { another } = await inquirer.prompt([
+      { type: 'confirm', name: 'another', message: 'Add another service?', default: false }
+    ]);
+    addMore = another;
+  }
+
+  // Configure links
+  const serviceNames = Object.keys(services);
+  if (serviceNames.length > 1) {
+    const { addLinks } = await inquirer.prompt([
+      { type: 'confirm', name: 'addLinks', message: 'Configure service links?', default: true }
+    ]);
+
+    if (addLinks) {
+      let addMoreLinks = true;
+      while (addMoreLinks) {
+        const { from } = await inquirer.prompt([
+          { type: 'list', name: 'from', message: 'Service that needs the URL:', choices: serviceNames }
+        ]);
+        const { to } = await inquirer.prompt([
+          { type: 'list', name: 'to', message: 'Service whose URL gets injected:', choices: serviceNames.filter(n => n !== from) }
+        ]);
+        const { envVar } = await inquirer.prompt([
+          { type: 'input', name: 'envVar', message: 'Environment variable name:', default: `${to.toUpperCase().replace(/-/g, '_')}_URL` }
+        ]);
+        links.push({ from, to, envVar });
+
+        const { moreLinks } = await inquirer.prompt([
+          { type: 'confirm', name: 'moreLinks', message: 'Add another link?', default: false }
+        ]);
+        addMoreLinks = moreLinks;
+      }
+    }
+  }
+
+  const manifest: AgentManifestV2 = {
+    schema: 'mandala-agent',
+    schemaVersion: '2.0',
+    env: {},
+    services,
+    links: links.length > 0 ? links : undefined,
+    deployments: deploymentTargets,
+  };
+
+  const manifestPath = path.resolve(process.cwd(), MANIFEST_FILE);
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  console.log(chalk.green(`\nMulti-service manifest created: ${MANIFEST_FILE}`));
+  if (!options?.silent) {
+    console.log(chalk.cyan('Next: Run "mandala agent deploy" to deploy all services.'));
+  }
+}
+
 export async function agentDeploy(configName?: string) {
   // ── Stage 1: Ensure agent-manifest.json exists ──
   let manifest = tryLoadAgentManifest();
@@ -395,7 +556,12 @@ export async function agentDeploy(configName?: string) {
     }
   }
 
-  // ── Stage 2: Ensure deployment config exists ──
+  // ── v2 Multi-Service Detection ──
+  if (isV2Manifest(manifest)) {
+    return agentDeployMultiService(manifest);
+  }
+
+  // ── Stage 2: Ensure deployment config exists (v1 single-service) ──
   let resolved = tryResolveDeploymentConfig(manifest, configName);
   if (!resolved) {
     console.log(chalk.yellow('No deployment configuration found.'));
@@ -538,7 +704,7 @@ export async function agentDeploy(configName?: string) {
 export async function agentStatus(configName?: string) {
   let config: MandalaConfig;
   try {
-    const manifest = loadAgentManifest();
+    const manifest = loadAgentManifest() as AgentManifest;
     const { cloudUrl, projectID, network } = await resolveDeploymentConfig(manifest, configName);
     config = { name: 'agent-status', provider: 'mandala', MandalaCloudURL: cloudUrl, projectID, network };
   } catch {
@@ -589,7 +755,7 @@ export async function agentStatus(configName?: string) {
 export async function agentConfigSet(key: string, value: string, configName?: string) {
   let config: MandalaConfig;
   try {
-    const manifest = loadAgentManifest();
+    const manifest = loadAgentManifest() as AgentManifest;
     const { cloudUrl, projectID, network } = await resolveDeploymentConfig(manifest, configName);
     config = { name: 'agent-config', provider: 'mandala', MandalaCloudURL: cloudUrl, projectID, network };
   } catch {
@@ -612,7 +778,7 @@ export async function agentConfigSet(key: string, value: string, configName?: st
 export async function agentConfigGet(configName?: string) {
   let config: MandalaConfig;
   try {
-    const manifest = loadAgentManifest();
+    const manifest = loadAgentManifest() as AgentManifest;
     const { cloudUrl, projectID, network } = await resolveDeploymentConfig(manifest, configName);
     config = { name: 'agent-config', provider: 'mandala', MandalaCloudURL: cloudUrl, projectID, network };
   } catch {
@@ -638,7 +804,7 @@ export async function agentConfigGet(configName?: string) {
 export async function agentLogs(configName?: string, options?: { since?: string; tail?: number; level?: string }) {
   let config: MandalaConfig;
   try {
-    const manifest = loadAgentManifest();
+    const manifest = loadAgentManifest() as AgentManifest;
     const { cloudUrl, projectID, network } = await resolveDeploymentConfig(manifest, configName);
     config = { name: 'agent-logs', provider: 'mandala', MandalaCloudURL: cloudUrl, projectID, network };
   } catch {
@@ -669,7 +835,7 @@ export async function agentLogs(configName?: string, options?: { since?: string;
 export async function agentRestart(configName?: string) {
   let config: MandalaConfig;
   try {
-    const manifest = loadAgentManifest();
+    const manifest = loadAgentManifest() as AgentManifest;
     const { cloudUrl, projectID, network } = await resolveDeploymentConfig(manifest, configName);
     config = { name: 'agent-restart', provider: 'mandala', MandalaCloudURL: cloudUrl, projectID, network };
   } catch {
@@ -878,6 +1044,374 @@ export async function agentFund() {
   }
 }
 
+// ---------- Topological Sort ----------
+
+function topologicalSortServices(
+  services: Record<string, ServiceDefinition>,
+  links: ServiceLink[]
+): string[] {
+  const names = Object.keys(services);
+  const inDegree: Record<string, number> = {};
+  const adj: Record<string, string[]> = {};
+
+  for (const name of names) {
+    inDegree[name] = 0;
+    adj[name] = [];
+  }
+
+  // link.to must deploy before link.from
+  for (const link of links) {
+    if (services[link.to] && services[link.from]) {
+      adj[link.to].push(link.from);
+      inDegree[link.from] = (inDegree[link.from] || 0) + 1;
+    }
+  }
+
+  // Kahn's algorithm
+  const queue: string[] = names.filter(n => inDegree[n] === 0);
+  const result: string[] = [];
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    result.push(current);
+    for (const neighbor of adj[current]) {
+      inDegree[neighbor]--;
+      if (inDegree[neighbor] === 0) queue.push(neighbor);
+    }
+  }
+
+  // If cycle detected, return all services (deploy all first, then link)
+  if (result.length !== names.length) {
+    console.log(chalk.yellow('Circular dependency detected in service links. Deploying all services then linking.'));
+    return names;
+  }
+
+  return result;
+}
+
+// ---------- Multi-Service Deploy ----------
+
+function resolveTargetForService(manifest: AgentManifestV2, serviceName: string): DeploymentTarget | undefined {
+  const svc = manifest.services[serviceName];
+  if (!svc?.provider) return manifest.deployments?.[0];
+  return manifest.deployments?.find(d => d.name === svc.provider);
+}
+
+async function waitForServiceReady(cloudUrl: string, projectID: string, timeoutMs = 300000): Promise<boolean> {
+  const config: MandalaConfig = { name: 'wait', provider: 'mandala', MandalaCloudURL: cloudUrl, projectID };
+  const client = await buildAuthFetch(config);
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const info = await safeRequest<ProjectInfo>(client, cloudUrl, `/api/v1/project/${projectID}/info`, {});
+      if (info?.status?.online) return true;
+    } catch { /* retry */ }
+    await new Promise(r => setTimeout(r, 5000));
+  }
+  return false;
+}
+
+export async function agentDeployMultiService(manifest: AgentManifestV2) {
+  const services = manifest.services;
+  const links = manifest.links || [];
+  const deployments = manifest.deployments || [];
+
+  if (deployments.length === 0) {
+    console.error(chalk.red('v2 manifest requires at least one deployment target.'));
+    return;
+  }
+
+  console.log(chalk.blue('\n━━━ Multi-Service Deployment ━━━\n'));
+
+  // 1. VALIDATE: Probe each target node
+  const spinner = ora('Validating deployment targets...').start();
+  for (const target of deployments) {
+    if (!target.MandalaCloudURL) {
+      // Auto-discover GPU nodes if capabilities.gpu but no URL
+      if (target.capabilities?.gpu) {
+        spinner.text = `Discovering GPU nodes for target "${target.name}"...`;
+        const gpuNodes = await discoverGpuNodes(target.capabilities.gpuType);
+        if (gpuNodes.length === 0) {
+          spinner.fail(`No GPU nodes found for target "${target.name}".`);
+          return;
+        }
+        spinner.stop();
+        const { chosenIdx } = await inquirer.prompt([{
+          type: 'list',
+          name: 'chosenIdx',
+          message: `Select a GPU node for "${target.name}":`,
+          choices: gpuNodes.map((n, i) => ({
+            name: `${n.url} (${n.capabilities.gpuType || 'GPU'}, ${n.capabilities.gpuAvailable} available)`,
+            value: i
+          }))
+        }]);
+        target.MandalaCloudURL = gpuNodes[chosenIdx].url;
+        spinner.start();
+      } else {
+        spinner.fail(`Target "${target.name}" has no MandalaCloudURL.`);
+        return;
+      }
+    }
+
+    try {
+      const caps = await probeNodeCapabilities(target.MandalaCloudURL);
+      if (!caps.schemaVersionsSupported.includes('2.0')) {
+        spinner.fail(`Node ${target.MandalaCloudURL} does not support schema v2.0`);
+        return;
+      }
+      if (target.capabilities?.gpu && !caps.gpu?.enabled) {
+        spinner.fail(`Node ${target.MandalaCloudURL} does not have GPU capability`);
+        return;
+      }
+    } catch (e: any) {
+      spinner.fail(`Cannot reach ${target.MandalaCloudURL}: ${e.message}`);
+      return;
+    }
+  }
+  spinner.succeed('All deployment targets validated.');
+
+  // 2. PREPARE: Ensure registered on each node, ensure project exists
+  spinner.start('Preparing deployment targets...');
+  for (const target of deployments) {
+    const config: MandalaConfig = { name: target.name, provider: 'mandala', MandalaCloudURL: target.MandalaCloudURL, projectID: target.projectID, network: target.network };
+    await ensureRegistered(config);
+
+    if (!target.projectID) {
+      spinner.stop();
+      console.log(chalk.yellow(`Target "${target.name}" has no projectID. Creating project...`));
+      const client = await buildAuthFetch(config);
+      const result = await safeRequest<{ projectId: string }>(client, target.MandalaCloudURL, '/api/v1/project/create', {
+        name: `${target.name}-project`,
+        network: target.network || 'mainnet'
+      });
+      if (!result?.projectId) {
+        console.error(chalk.red(`Failed to create project on ${target.MandalaCloudURL}`));
+        return;
+      }
+      target.projectID = result.projectId;
+      console.log(chalk.green(`Created project ${result.projectId} on ${target.MandalaCloudURL}`));
+      spinner.start();
+    }
+  }
+  spinner.succeed('Deployment targets prepared.');
+
+  // 3. DEPLOY: In dependency order
+  const deployOrder = topologicalSortServices(services, links);
+  const serviceUrls: Record<string, string> = {};
+
+  console.log(chalk.blue(`\nDeploy order: ${deployOrder.join(' → ')}\n`));
+
+  for (const serviceName of deployOrder) {
+    const target = resolveTargetForService(manifest, serviceName);
+    if (!target) {
+      console.error(chalk.red(`No deployment target found for service "${serviceName}"`));
+      return;
+    }
+
+    console.log(chalk.blue(`\n── Deploying "${serviceName}" to ${target.MandalaCloudURL} ──`));
+
+    const config: MandalaConfig = {
+      name: serviceName,
+      provider: 'mandala',
+      MandalaCloudURL: target.MandalaCloudURL,
+      projectID: target.projectID,
+      network: target.network
+    };
+
+    // Ensure manifest deployments match
+    ensureManifestDeploymentEntry(manifest as any, target.MandalaCloudURL, target.projectID!, target.network || 'mainnet');
+
+    // Package
+    const packageSpinner = ora(`Packaging ${serviceName}...`).start();
+    const artifactName = `mandala_agent_${serviceName}_${Date.now()}.tgz`;
+    const cwd = process.cwd();
+    const buildContext = manifest.services[serviceName].agent.buildContext || '.';
+    const buildDir = path.resolve(cwd, buildContext);
+
+    const excludePatterns = ['node_modules', '.git', 'dist', '.env', '*.tgz', 'mandala_artifact_*', 'mandala_agent_*'];
+
+    await tar.create({
+      gzip: true,
+      file: artifactName,
+      cwd: buildDir,
+      filter: (filePath) => {
+        const relative = filePath.startsWith('./') ? filePath.slice(2) : filePath;
+        for (const pattern of excludePatterns) {
+          if (pattern.includes('*')) {
+            if (relative.startsWith(pattern.replace('*', ''))) return false;
+          } else {
+            if (relative === pattern || relative.startsWith(pattern + '/')) return false;
+          }
+        }
+        return true;
+      }
+    }, ['.']);
+    packageSpinner.succeed(`${serviceName} packaged.`);
+
+    // Create deployment
+    const deploySpinner = ora(`Creating deployment for ${serviceName}...`).start();
+    const client = await buildAuthFetch(config);
+    const result = await safeRequest<{ url: string; deploymentId: string }>(
+      client, target.MandalaCloudURL, `/api/v1/project/${target.projectID}/deploy`, {}
+    );
+    if (!result?.url || !result?.deploymentId) {
+      deploySpinner.fail(`Failed to create deployment for ${serviceName}.`);
+      fs.unlinkSync(artifactName);
+      return;
+    }
+    deploySpinner.succeed(`Deployment created: ${result.deploymentId}`);
+
+    // Upload with serviceName query param
+    const uploadUrl = `${result.url}?serviceName=${encodeURIComponent(serviceName)}`;
+    await uploadArtifact(uploadUrl, artifactName);
+    fs.unlinkSync(artifactName);
+
+    // Sync env vars
+    const svc = manifest.services[serviceName];
+    const mergedEnv = { ...(manifest.env || {}), ...(svc.env || {}) };
+    if (Object.keys(mergedEnv).length > 0) {
+      await safeRequest(client, target.MandalaCloudURL, `/api/v1/project/${target.projectID}/settings/update`, { env: mergedEnv });
+    }
+
+    // Wait for ready
+    const waitSpinner = ora(`Waiting for ${serviceName} to come online...`).start();
+    const isReady = await waitForServiceReady(target.MandalaCloudURL, target.projectID!);
+    if (isReady) {
+      waitSpinner.succeed(`${serviceName} is online.`);
+    } else {
+      waitSpinner.warn(`${serviceName} did not become ready in time. Continuing...`);
+    }
+
+    // Record URL
+    const projectDomain = target.MandalaCloudURL.replace(/^https?:\/\//, '');
+    serviceUrls[serviceName] = `https://agent.${target.projectID}.${projectDomain}`;
+  }
+
+  // 4. LINK: Inject URLs
+  if (links.length > 0) {
+    console.log(chalk.blue('\n── Linking services ──'));
+
+    for (const link of links) {
+      const toUrl = serviceUrls[link.to];
+      if (!toUrl) {
+        console.error(chalk.red(`Cannot resolve URL for service "${link.to}"`));
+        continue;
+      }
+
+      const fromTarget = resolveTargetForService(manifest, link.from);
+      if (!fromTarget?.projectID) {
+        console.error(chalk.red(`No target for service "${link.from}"`));
+        continue;
+      }
+
+      const config: MandalaConfig = {
+        name: link.from,
+        provider: 'mandala',
+        MandalaCloudURL: fromTarget.MandalaCloudURL,
+        projectID: fromTarget.projectID,
+      };
+      const client = await buildAuthFetch(config);
+
+      // Inject env var
+      console.log(chalk.cyan(`  ${link.from}.${link.envVar} → ${toUrl}`));
+      await safeRequest(client, fromTarget.MandalaCloudURL, `/api/v1/project/${fromTarget.projectID}/settings/update`, {
+        env: { [link.envVar]: toUrl }
+      });
+
+      // Store link metadata
+      await safeRequest(client, fromTarget.MandalaCloudURL, `/api/v1/project/${fromTarget.projectID}/service-links`, {
+        links: [{ envVar: link.envVar, url: toUrl }]
+      });
+
+      // Restart to pick up new env
+      await safeRequest(client, fromTarget.MandalaCloudURL, `/api/v1/project/${fromTarget.projectID}/admin/restart`, {});
+    }
+  }
+
+  // 5. REPORT
+  console.log(chalk.green('\n━━━ Deployment Complete ━━━\n'));
+  const table = new Table({ head: ['Service', 'Node', 'URL', 'Status'] });
+  for (const name of deployOrder) {
+    const target = resolveTargetForService(manifest, name);
+    table.push([
+      name,
+      target?.MandalaCloudURL || '-',
+      serviceUrls[name] || '-',
+      chalk.green('Deployed')
+    ]);
+  }
+  console.log(table.toString());
+
+  if (links.length > 0) {
+    console.log(chalk.blue('\nService Links:'));
+    const linkTable = new Table({ head: ['From', 'To', 'Env Var', 'URL'] });
+    for (const link of links) {
+      linkTable.push([link.from, link.to, link.envVar, serviceUrls[link.to] || '-']);
+    }
+    console.log(linkTable.toString());
+  }
+
+  // Save updated manifest with resolved projectIDs
+  const manifestPath = path.resolve(process.cwd(), MANIFEST_FILE);
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+}
+
+// ---------- Consolidated Billing ----------
+
+export async function agentBilling(configName?: string) {
+  const manifest = tryLoadAgentManifest();
+
+  if (!manifest || !isV2Manifest(manifest)) {
+    // Single-service: delegate to simple billing view
+    if (!manifest) {
+      console.error(chalk.red('No agent manifest found.'));
+      return;
+    }
+    const resolved = tryResolveDeploymentConfig(manifest as AgentManifest, configName);
+    if (!resolved) {
+      console.error(chalk.red('No deployment configuration found.'));
+      return;
+    }
+    const config: MandalaConfig = { name: 'billing', provider: 'mandala', MandalaCloudURL: resolved.cloudUrl, projectID: resolved.projectID };
+    await ensureRegistered(config);
+    const client = await buildAuthFetch(config);
+    const info = await safeRequest<ProjectInfo>(client, resolved.cloudUrl, `/api/v1/project/${resolved.projectID}/info`, {});
+    if (info) {
+      console.log(chalk.blue(`Balance: ${info.billing.balance} sats`));
+    }
+    return;
+  }
+
+  // Multi-service: show consolidated billing
+  console.log(chalk.blue('\n━━━ Consolidated Billing ━━━\n'));
+  const table = new Table({ head: ['Service', 'Node', 'Balance (sats)'] });
+
+  let totalBalance = 0;
+  for (const [name, svc] of Object.entries(manifest.services)) {
+    const target = resolveTargetForService(manifest, name);
+    if (!target?.projectID || !target.MandalaCloudURL) {
+      table.push([name, '-', chalk.yellow('Not deployed')]);
+      continue;
+    }
+
+    try {
+      const config: MandalaConfig = { name, provider: 'mandala', MandalaCloudURL: target.MandalaCloudURL, projectID: target.projectID };
+      await ensureRegistered(config);
+      const client = await buildAuthFetch(config);
+      const info = await safeRequest<ProjectInfo>(client, target.MandalaCloudURL, `/api/v1/project/${target.projectID}/info`, {});
+      const balance = info?.billing?.balance ?? 0;
+      totalBalance += balance;
+      table.push([name, target.MandalaCloudURL, balance.toString()]);
+    } catch {
+      table.push([name, target.MandalaCloudURL, chalk.red('Error')]);
+    }
+  }
+
+  console.log(table.toString());
+  console.log(chalk.blue(`\nTotal across all services: ${totalBalance} sats`));
+}
+
 export async function agentMenu() {
   const choices = [
     { name: 'Initialize Agent Manifest', value: 'init' },
@@ -885,6 +1419,7 @@ export async function agentMenu() {
     { name: 'Chat with Agent', value: 'chat' },
     { name: 'Fund Agent Wallet', value: 'fund' },
     { name: 'View Agent Status', value: 'status' },
+    { name: 'View Billing', value: 'billing' },
     { name: 'Get Agent Config', value: 'config-get' },
     { name: 'Set Agent Config', value: 'config-set' },
     { name: 'View Agent Logs', value: 'logs' },
@@ -908,6 +1443,8 @@ export async function agentMenu() {
       await agentFund();
     } else if (action === 'status') {
       await agentStatus();
+    } else if (action === 'billing') {
+      await agentBilling();
     } else if (action === 'config-get') {
       await agentConfigGet();
     } else if (action === 'config-set') {

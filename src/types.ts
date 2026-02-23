@@ -96,6 +96,74 @@ export interface AgentManifest {
   deployments?: Array<{ provider: 'mandala'; projectID?: string; network?: string; MandalaCloudURL?: string }>;
 }
 
+// ---------- V2 Manifest Types ----------
+
+export interface ServiceDefinition {
+  agent: {
+    type: 'openclaw' | 'agidentity' | 'custom';
+    image?: string;
+    dockerfile?: string;
+    buildContext?: string;
+    runtime?: 'node' | 'python' | 'docker';
+  };
+  env?: Record<string, string>;
+  resources?: { cpu?: string; memory?: string; gpu?: string };
+  ports?: number[];
+  healthCheck?: { path: string; port?: number; intervalSeconds?: number };
+  frontend?: { directory?: string; image?: string } | null;
+  storage?: { enabled: boolean; size?: string; mountPath?: string };
+  databases?: { mysql?: boolean; mongo?: boolean; redis?: boolean };
+  provider?: string;
+}
+
+export interface ServiceLink {
+  from: string;
+  to: string;
+  envVar: string;
+}
+
+export interface DeploymentTarget {
+  name: string;
+  provider: 'mandala';
+  MandalaCloudURL: string;
+  projectID?: string;
+  network?: string;
+  capabilities?: {
+    gpu?: boolean;
+    gpuType?: string;
+  };
+}
+
+export interface AgentManifestV2 {
+  schema: 'mandala-agent';
+  schemaVersion: '2.0';
+  services: Record<string, ServiceDefinition>;
+  links?: ServiceLink[];
+  env?: Record<string, string>;
+  deployments?: DeploymentTarget[];
+}
+
+export function isV2Manifest(m: any): m is AgentManifestV2 {
+  return m?.schemaVersion === '2.0' && m?.services != null;
+}
+
+export interface NodeCapabilities {
+  url: string;
+  gpu: { enabled: boolean; type?: string; total?: number; available?: number; rate_per_unit_5min?: number };
+  pricing: Record<string, number>;
+  supportedRuntimes: string[];
+  schemaVersionsSupported: string[];
+}
+
+export interface DiscoveredNode {
+  url: string;
+  identityKey: string;
+  capabilities: { gpu: boolean; gpuType?: string; gpuTotal?: number; gpuAvailable?: number };
+  pricing: Record<string, number>;
+  runtimes: string[];
+  lastSeen: string;
+}
+
 export const VALID_LOG_PERIODS = ['5m', '15m', '30m', '1h', '2h', '6h', '12h', '1d', '2d', '7d'] as const;
 export const VALID_LOG_LEVELS = ['all', 'error', 'warn', 'info'] as const;
 
