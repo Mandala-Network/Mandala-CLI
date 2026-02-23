@@ -733,11 +733,11 @@ export async function agentStatus(configName?: string) {
   table.push(['Current Deployment', info.status.deploymentId || 'None']);
   table.push(['Balance', `${info.billing.balance} sats`]);
   table.push(['SSL', info.sslEnabled ? 'Yes' : 'No']);
-  if (info.status.domains.backend) {
-    table.push(['Agent URL', info.status.domains.backend]);
+  if (info.status.domains.agent) {
+    table.push(['Agent URL', info.status.domains.agent]);
   }
-  if (info.customDomains.backend) {
-    table.push(['Custom Domain', info.customDomains.backend]);
+  if (info.customDomains.agent) {
+    table.push(['Custom Domain', info.customDomains.agent]);
   }
   if (info.status.domains.frontend) {
     table.push(['Frontend URL', info.status.domains.frontend]);
@@ -822,7 +822,7 @@ export async function agentLogs(configName?: string, options?: { since?: string;
   const result = await safeRequest<{ logs: string; metadata: any }>(
     client,
     config.MandalaCloudURL,
-    `/api/v1/project/${config.projectID}/logs/resource/backend`,
+    `/api/v1/project/${config.projectID}/logs/resource/agent`,
     { since, tail, level }
   );
 
@@ -1097,9 +1097,11 @@ function resolveTargetForService(manifest: AgentManifestV2, serviceName: string)
   return manifest.deployments?.find(d => d.name === svc.provider);
 }
 
-async function waitForServiceReady(cloudUrl: string, projectID: string, timeoutMs = 300000): Promise<boolean> {
-  const config: MandalaConfig = { name: 'wait', provider: 'mandala', MandalaCloudURL: cloudUrl, projectID };
-  const client = await buildAuthFetch(config);
+async function waitForServiceReady(cloudUrl: string, projectID: string, client?: any, timeoutMs = 300000): Promise<boolean> {
+  if (!client) {
+    const config: MandalaConfig = { name: 'wait', provider: 'mandala', MandalaCloudURL: cloudUrl, projectID };
+    client = await buildAuthFetch(config);
+  }
   const start = Date.now();
 
   while (Date.now() - start < timeoutMs) {
@@ -1219,9 +1221,6 @@ export async function agentDeployMultiService(manifest: AgentManifestV2) {
       network: target.network
     };
 
-    // Ensure manifest deployments match
-    ensureManifestDeploymentEntry(manifest as any, target.MandalaCloudURL, target.projectID!, target.network || 'mainnet');
-
     // Package
     const packageSpinner = ora(`Packaging ${serviceName}...`).start();
     const artifactName = `mandala_agent_${serviceName}_${Date.now()}.tgz`;
@@ -1276,16 +1275,27 @@ export async function agentDeployMultiService(manifest: AgentManifestV2) {
 
     // Wait for ready
     const waitSpinner = ora(`Waiting for ${serviceName} to come online...`).start();
-    const isReady = await waitForServiceReady(target.MandalaCloudURL, target.projectID!);
+    const isReady = await waitForServiceReady(target.MandalaCloudURL, target.projectID!, client);
     if (isReady) {
       waitSpinner.succeed(`${serviceName} is online.`);
     } else {
       waitSpinner.warn(`${serviceName} did not become ready in time. Continuing...`);
     }
 
-    // Record URL
-    const projectDomain = target.MandalaCloudURL.replace(/^https?:\/\//, '');
-    serviceUrls[serviceName] = `https://agent.${target.projectID}.${projectDomain}`;
+    // Record URL from the node's actual domain (don't guess — read from /info)
+    try {
+      const infoResp = await safeRequest<ProjectInfo>(client, target.MandalaCloudURL, `/api/v1/project/${target.projectID}/info`, {});
+      if (infoResp?.status?.domains?.agent) {
+        serviceUrls[serviceName] = `https://${infoResp.status.domains.agent}`;
+      } else {
+        // Fallback: derive from node URL (may be wrong if PROJECT_DEPLOYMENT_DNS_NAME differs)
+        const projectDomain = target.MandalaCloudURL.replace(/^https?:\/\//, '');
+        serviceUrls[serviceName] = `https://agent.${target.projectID}.${projectDomain}`;
+      }
+    } catch {
+      const projectDomain = target.MandalaCloudURL.replace(/^https?:\/\//, '');
+      serviceUrls[serviceName] = `https://agent.${target.projectID}.${projectDomain}`;
+    }
   }
 
   // 4. LINK: Inject URLs

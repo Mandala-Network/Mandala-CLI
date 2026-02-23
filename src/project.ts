@@ -204,7 +204,7 @@ export async function showProjectInfo(config: MandalaConfig) {
   table.push(['Current Deployment', info.status.deploymentId || 'None']);
   table.push(['SSL Enabled', info.sslEnabled ? 'Yes' : 'No']);
   table.push(['Frontend Domain', info.status.domains.frontend || info.customDomains.frontend || 'None']);
-  table.push(['Backend Domain', info.status.domains.backend || info.customDomains.backend || 'None']);
+  table.push(['Agent Domain', info.status.domains.agent || info.customDomains.agent || 'None']);
   console.log(table.toString());
 
   if (info.webUIConfig) {

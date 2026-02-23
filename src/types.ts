@@ -31,7 +31,7 @@ export interface ProjectInfo {
   status: {
     online: boolean;
     lastChecked: string;
-    domains: { frontend?: string; backend?: string; ssl: boolean };
+    domains: { frontend?: string; agent?: string; ssl: boolean };
     deploymentId: string | null;
   };
   billing: {
@@ -40,7 +40,7 @@ export interface ProjectInfo {
   sslEnabled: boolean;
   customDomains: {
     frontend?: string;
-    backend?: string;
+    agent?: string;
   };
   webUIConfig: any;
   agentConfig?: Record<string, string>;
