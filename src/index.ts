@@ -2,20 +2,20 @@
 import { program } from 'commander';
 import fs from 'fs';
 import path from 'path';
-import chalk from 'chalk/index.js';
+import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { remakeWallet } from './wallet.js';
 import { authFetch } from './wallet.js';
 import {
-  loadMandalaConfigInfo, saveMandalaConfigInfo, pickMandalaConfig,
+  loadMandalaConfigInfo, tryLoadMandalaConfigInfo, saveMandalaConfigInfo, pickMandalaConfig,
   isMandalaConfig, addMandalaConfigInteractive, editMandalaConfigInteractive,
   deleteMandalaConfig, findConfigByNameOrIndex, chooseMandalaCloudURL,
-  printAllConfigsWithIndex, configMenu, listAllConfigs
+  printAllConfigsWithIndex, configMenu, listAllConfigs, initProject
 } from './config.js';
 import { buildArtifact, findArtifacts, findLatestArtifact, printArtifactsList, artifactMenu } from './artifact.js';
 import { projectMenu, showProjectInfo, fetchResourceLogs, pickReleaseId, showGlobalPublicInfo } from './project.js';
 import { releaseMenu } from './release.js';
-import { agentInit, agentDeploy, agentStatus, agentConfigSet, agentConfigGet, agentLogs, agentRestart, agentMenu } from './agent.js';
+import { agentInit, agentDeploy, agentChat, agentFund, agentStatus, agentConfigSet, agentConfigGet, agentLogs, agentRestart, agentMenu } from './agent.js';
 import {
   ensureRegistered, safeRequest, buildAuthFetch, handleRequestError,
   uploadArtifact, printProjectList, printAdminsList, printLogs, printReleasesList
@@ -26,6 +26,19 @@ program
   .name('mandala')
   .description('Mandala CLI — Deploy agents and overlays on the Mandala Network')
   .version('1.0.0');
+
+// ─── Init Command ─────────────────────────────────────────────────────────────
+
+program
+  .command('init')
+  .option('--key <key>', 'Private key')
+  .option('--network <network>', 'Network')
+  .option('--storage <storage>', 'Wallet storage')
+  .description('Initialize a new mandala.json project configuration')
+  .action(async (options) => {
+    if (options.key) await remakeWallet(options.key, options.network, options.storage);
+    await initProject();
+  });
 
 // ─── Config Commands ───────────────────────────────────────────────────────────
 
@@ -53,7 +66,12 @@ configCommand
   .description('Add a new Mandala configuration')
   .action(async (options) => {
     if (options.key) await remakeWallet(options.key, options.network, options.storage);
-    const info = loadMandalaConfigInfo();
+    let info = tryLoadMandalaConfigInfo();
+    if (!info) {
+      console.log(chalk.yellow('No mandala.json found. Creating one.'));
+      info = { schema: 'bsv-app', schemaVersion: '1.0', configs: [] };
+      saveMandalaConfigInfo(info);
+    }
     await addMandalaConfigInteractive(info);
   });
 
@@ -617,6 +635,22 @@ agentCommand
   });
 
 agentCommand
+  .command('chat')
+  .description('Chat with a deployed agent')
+  .action(async () => { await agentChat(); });
+
+agentCommand
+  .command('fund')
+  .option('--key <key>', 'Private key')
+  .option('--network <network>', 'Network')
+  .option('--storage <storage>', 'Wallet storage')
+  .description('Fund a deployed agent\'s BSV wallet')
+  .action(async (options) => {
+    if (options.key) await remakeWallet(options.key, options.network, options.storage);
+    await agentFund();
+  });
+
+agentCommand
   .command('status [configName]')
   .option('--key <key>', 'Private key')
   .option('--network <network>', 'Network')
@@ -747,27 +781,9 @@ const AGENT_MANIFEST_PATH = path.resolve(process.cwd(), 'agent-manifest.json');
     const hasConfig = fs.existsSync(MANDALA_CONFIG_PATH) || fs.existsSync(LEGACY_CONFIG_PATH);
 
     if (!hasConfig && !hasAgentManifest) {
-      // Nothing found — ask what they want to do
-      const { mode } = await inquirer.prompt([
-        {
-          type: 'list',
-          name: 'mode',
-          message: 'No configuration found. What would you like to do?',
-          choices: [
-            { name: 'Initialize an Agent (agent-manifest.json)', value: 'agent-init' },
-            { name: 'Create an Overlay/App configuration (mandala.json)', value: 'overlay-init' }
-          ]
-        }
-      ]);
-
-      if (mode === 'agent-init') {
-        await agentInit();
-      } else {
-        const basicInfo = { schema: 'bsv-app', schemaVersion: '1.0' };
-        saveMandalaConfigInfo(basicInfo);
-        const info = loadMandalaConfigInfo();
-        await addMandalaConfigInteractive(info);
-      }
+      // Nothing found — run the init wizard
+      console.log(chalk.yellow('No configuration found in this directory.\n'));
+      await initProject();
     }
 
     await mainMenu();

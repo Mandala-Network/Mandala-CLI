@@ -43,7 +43,7 @@ export interface ProjectInfo {
     backend?: string;
   };
   webUIConfig: any;
-  agent_config?: Record<string, string>;
+  agentConfig?: Record<string, string>;
 }
 
 export interface ProjectListing {

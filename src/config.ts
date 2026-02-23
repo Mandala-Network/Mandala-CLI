@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import chalk from 'chalk/index.js';
+import chalk from 'chalk';
 import inquirer from 'inquirer';
 import Table from 'cli-table3';
 import { authFetch, walletClient, remakeWallet } from './wallet.js';
@@ -15,6 +15,27 @@ function getConfigPath(): string {
   if (fs.existsSync(MANDALA_CONFIG_PATH)) return MANDALA_CONFIG_PATH;
   if (fs.existsSync(LEGACY_CONFIG_PATH)) return LEGACY_CONFIG_PATH;
   return MANDALA_CONFIG_PATH; // default for new projects
+}
+
+export function tryLoadMandalaConfigInfo(): MandalaConfigInfo | null {
+  const configPath = getConfigPath();
+  if (!fs.existsSync(configPath)) return null;
+  const info = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  if (info.deployments && !info.configs) {
+    info.configs = info.deployments;
+    delete info.deployments;
+    saveMandalaConfigInfo(info);
+  }
+  if (info.configs) {
+    for (const c of info.configs) {
+      if (c.CARSCloudURL && !c.MandalaCloudURL) {
+        c.MandalaCloudURL = c.CARSCloudURL;
+        delete c.CARSCloudURL;
+      }
+    }
+  }
+  info.configs = info.configs || [];
+  return info;
 }
 
 export function loadMandalaConfigInfo(): MandalaConfigInfo {
@@ -205,7 +226,9 @@ async function chooseOrCreateProjectID(cloudUrl: string, currentProjectID?: stri
   }
 }
 
-export async function addMandalaConfigInteractive(info: MandalaConfigInfo): Promise<MandalaConfig> {
+export async function addMandalaConfigInteractive(info: MandalaConfigInfo, options?: { projectType?: string }): Promise<MandalaConfig> {
+  const isAgent = options?.projectType === 'agent';
+
   const cloudChoices = [
     { name: 'Babbage (cars.babbage.systems)', value: 'https://cars.babbage.systems' },
     { name: 'ATX (cars.atx.systems)', value: 'https://cars.atx.systems' },
@@ -213,7 +236,7 @@ export async function addMandalaConfigInteractive(info: MandalaConfigInfo): Prom
     { name: 'Local (dev) localhost:7777', value: 'http://localhost:7777' },
   ];
 
-  const { name, cloudUrlChoice, customCloudUrl, network, deployTargets } = await inquirer.prompt([
+  const prompts: any[] = [
     {
       type: 'input',
       name: 'name',
@@ -230,7 +253,7 @@ export async function addMandalaConfigInteractive(info: MandalaConfigInfo): Prom
       type: 'input',
       name: 'customCloudUrl',
       message: 'Enter custom Mandala Node URL:',
-      when: (ans) => ans.cloudUrlChoice === 'custom',
+      when: (ans: any) => ans.cloudUrlChoice === 'custom',
       default: 'http://localhost:7777'
     },
     {
@@ -239,7 +262,10 @@ export async function addMandalaConfigInteractive(info: MandalaConfigInfo): Prom
       message: 'Network (e.g. testnet/mainnet):',
       default: 'mainnet'
     },
-    {
+  ];
+
+  if (!isAgent) {
+    prompts.push({
       type: 'checkbox',
       name: 'deployTargets',
       message: 'Select what to release with this config:',
@@ -247,8 +273,12 @@ export async function addMandalaConfigInteractive(info: MandalaConfigInfo): Prom
         { name: 'frontend', value: 'frontend', checked: true },
         { name: 'backend', value: 'backend', checked: true },
       ]
-    }
-  ]);
+    });
+  }
+
+  const answers = await inquirer.prompt(prompts);
+  const { name, cloudUrlChoice, customCloudUrl, network } = answers;
+  const deployTargets: string[] = isAgent ? ['backend'] : answers.deployTargets;
 
   let frontendHostingMethod: string | undefined = undefined;
   if (deployTargets.includes('frontend')) {
@@ -417,6 +447,139 @@ export async function chooseMandalaCloudURL(info: MandalaConfigInfo, specifiedNa
   ]);
 
   return chosenURL;
+}
+
+export async function initProject(): Promise<MandalaConfigInfo> {
+  const existingInfo = tryLoadMandalaConfigInfo();
+  if (existingInfo) {
+    const configPath = getConfigPath();
+    console.log(chalk.yellow(`${path.basename(configPath)} already exists in this directory.`));
+    const { overwrite } = await inquirer.prompt([
+      { type: 'confirm', name: 'overwrite', message: 'Overwrite existing configuration?', default: false }
+    ]);
+    if (!overwrite) {
+      console.log(chalk.cyan('Keeping existing configuration.'));
+      return existingInfo;
+    }
+  }
+
+  console.log(chalk.blue('Mandala Project Initialization\n'));
+
+  const { projectType } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'projectType',
+      message: 'What type of project is this?',
+      choices: [
+        { name: 'Agent - An AI agent or backend service', value: 'agent' },
+        { name: 'Overlay - A BSV overlay service', value: 'overlay' },
+        { name: 'App - A web application with frontend and/or backend', value: 'app' }
+      ]
+    }
+  ]);
+
+  // Build the base MandalaConfigInfo depending on project type
+  let info: MandalaConfigInfo;
+  if (projectType === 'overlay') {
+    const { topicManagersRaw, lookupServicesRaw } = await inquirer.prompt([
+      {
+        type: 'input',
+        name: 'topicManagersRaw',
+        message: 'Topic managers (comma-separated "name:path" pairs, or leave blank):',
+        default: ''
+      },
+      {
+        type: 'input',
+        name: 'lookupServicesRaw',
+        message: 'Lookup services (comma-separated "name:path" pairs, or leave blank):',
+        default: ''
+      }
+    ]);
+
+    const topicManagers: Record<string, string> = {};
+    if (topicManagersRaw.trim()) {
+      for (const entry of topicManagersRaw.split(',')) {
+        const [name, filePath] = entry.trim().split(':');
+        if (name && filePath) topicManagers[name.trim()] = filePath.trim();
+      }
+    }
+
+    const lookupServices: Record<string, { serviceFactory: string }> = {};
+    if (lookupServicesRaw.trim()) {
+      for (const entry of lookupServicesRaw.split(',')) {
+        const [name, filePath] = entry.trim().split(':');
+        if (name && filePath) lookupServices[name.trim()] = { serviceFactory: filePath.trim() };
+      }
+    }
+
+    info = {
+      schema: 'bsv-overlay',
+      schemaVersion: '1.0',
+      topicManagers: Object.keys(topicManagers).length > 0 ? topicManagers : undefined,
+      lookupServices: Object.keys(lookupServices).length > 0 ? lookupServices : undefined,
+      configs: []
+    };
+  } else if (projectType === 'app') {
+    const { hasFrontend } = await inquirer.prompt([
+      { type: 'confirm', name: 'hasFrontend', message: 'Does this project have a frontend?', default: true }
+    ]);
+
+    let frontend: MandalaConfigInfo['frontend'] | undefined;
+    if (hasFrontend) {
+      const { language, sourceDirectory } = await inquirer.prompt([
+        {
+          type: 'list',
+          name: 'language',
+          message: 'Frontend language/framework:',
+          choices: ['react', 'vue', 'angular', 'vanilla', 'other'],
+          default: 'react'
+        },
+        {
+          type: 'input',
+          name: 'sourceDirectory',
+          message: 'Frontend source directory:',
+          default: 'frontend'
+        }
+      ]);
+      frontend = { language, sourceDirectory };
+    }
+
+    info = {
+      schema: 'bsv-app',
+      schemaVersion: '1.0',
+      frontend,
+      configs: []
+    };
+  } else {
+    // Agent type -- minimal mandala.json, agent-manifest.json is the primary config
+    info = {
+      schema: 'mandala-agent',
+      schemaVersion: '1.0',
+      configs: []
+    };
+  }
+
+  saveMandalaConfigInfo(info);
+  console.log(chalk.green('\nmandala.json created.'));
+
+  // Offer to add a deployment configuration
+  const { addConfig } = await inquirer.prompt([
+    { type: 'confirm', name: 'addConfig', message: 'Add a Mandala Node deployment configuration now?', default: true }
+  ]);
+
+  if (addConfig) {
+    await addMandalaConfigInteractive(info, { projectType });
+  }
+
+  console.log(chalk.cyan('\nProject initialized. Your mandala.json is ready.'));
+  if (projectType === 'agent') {
+    const agentManifestPath = path.resolve(process.cwd(), 'agent-manifest.json');
+    if (!fs.existsSync(agentManifestPath)) {
+      console.log(chalk.cyan('Run "mandala agent init" to create an agent-manifest.json.'));
+    }
+  }
+
+  return info;
 }
 
 export async function configMenu() {

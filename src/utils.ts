@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import chalk from 'chalk/index.js';
+import chalk from 'chalk';
 import axios from 'axios';
 import ora from 'ora';
 import Table from 'cli-table3';

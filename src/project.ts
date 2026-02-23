@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import chalk from 'chalk/index.js';
+import chalk from 'chalk';
 import inquirer from 'inquirer';
 import axios from 'axios';
 import ora from 'ora';

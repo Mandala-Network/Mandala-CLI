@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import * as tar from 'tar';
 import { spawnSync } from 'child_process';
-import chalk from 'chalk/index.js';
+import chalk from 'chalk';
 import inquirer from 'inquirer';
 import Table from 'cli-table3';
 import { loadMandalaConfigInfo, pickMandalaConfig } from './config.js';
